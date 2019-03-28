@@ -16,10 +16,13 @@ import re
 import subprocess
 import readline
 import configparser
+import logging
+import traceback
 from argparse import HelpFormatter
 from datetime import datetime
 from operator import attrgetter
 from locale   import atof
+from pprint   import pprint
 
 
 class FileType(object):
@@ -332,6 +335,7 @@ def parse_args_and_config_file():
               ' (default: {0})'.format(DEFAULTS.effective_date)))
     parser.add_argument(
         '--desc',
+        '--description',
         metavar='STR',
         help=('CSV column number matching description'
               ' (default: {0})'.format(DEFAULTS.desc)))
@@ -346,6 +350,12 @@ def parse_args_and_config_file():
         metavar='INT',
         type=int,
         help=('CSV column number matching credit amount'
+              ' (default: {0})'.format(DEFAULTS.credit)))
+    parser.add_argument(
+        '--creditdebit',
+        metavar='INT',
+        type=int,
+        help=('CSV column number matching credit/debit.  Will use --credit field'
               ' (default: {0})'.format(DEFAULTS.credit)))
     parser.add_argument(
         '--csv-date-format',
@@ -515,12 +525,23 @@ class Entry:
             desc.append(fields[int(index) - 1].strip())
         self.desc = ' '.join(desc).strip()
 
-        self.credit = get_field_at_index(fields, options.credit, options.csv_decimal_comma, options.ledger_decimal_comma)
-        self.debit = get_field_at_index(fields, options.debit, options.csv_decimal_comma, options.ledger_decimal_comma)
-        if self.credit  and self.debit and atof(self.credit) == 0:
-            self.credit = ''
-        elif self.credit and self.debit and atof(self.debit) == 0:
-            self.debit  = ''
+        if options.creditdebit and options.creditdebit > 0:
+            creditdebit = fields[options.creditdebit - 1].lower()
+            if creditdebit == "credit":
+                self.credit = get_field_at_index(fields, options.credit, options.csv_decimal_comma,
+                                                 options.ledger_decimal_comma)
+                self.debit = ''
+            else:
+                self.debit = get_field_at_index(fields, options.credit, options.csv_decimal_comma,
+                                                 options.ledger_decimal_comma)
+                self.credit = ''
+        else:
+            self.credit = get_field_at_index(fields, options.credit, options.csv_decimal_comma, options.ledger_decimal_comma)
+            self.debit = get_field_at_index(fields, options.debit, options.csv_decimal_comma, options.ledger_decimal_comma)
+            if self.credit  and self.debit and atof(self.credit) == 0:
+                self.credit = ''
+            elif self.credit and self.debit and atof(self.debit) == 0:
+                self.debit  = ''
 
         self.credit_account = options.account
         if options.src_account:
@@ -673,15 +694,18 @@ def payees_from_ledger(ledger_file, ledger_binary_file):
 def accounts_from_ledger(ledger_file, ledger_binary_file):
     return from_ledger(ledger_file, ledger_binary_file, 'accounts')
 
-
-def from_ledger(ledger_file, ledger_binary_file, command):
+def mappings_from_ledger(ledger_file, ledger_binary_file):
+    ledger_iter = from_ledger(ledger_file, ledger_binary_file, 'csv', '--csv-format', '%(quoted(payee)),%(quoted(payee)),%(quoted(account))\n%/')
+    return read_mapping_iter(csv.reader(ledger_iter))
+    
+def from_ledger(ledger_file, ledger_binary_file, command, *ledger_args):
     if ledger_binary_file is not None:
         # if either the --ledger-binary parameter was specified or a default ledger path was valid, use that
         ledger = ledger_binary_file
     else:
         # otherwise let's hope it's in PATH
         ledger = 'ledger'
-    cmd = [ledger, "-f", ledger_file, command]
+    cmd = [ledger, "-f", ledger_file, command] + list(ledger_args)
     try:
         p = subprocess.Popen(
             cmd,
@@ -695,6 +719,26 @@ def from_ledger(ledger_file, ledger_binary_file, command):
         raise FileNotFoundError('The system can\'t find the following ledger binary: {0}'.format(ledger))
 
 
+
+def read_mapping_iter(map_iter):
+    mappings = []
+    for row in map_iter:
+        if len(row) > 1:
+            pattern = row[0].strip()
+            payee = row[1].strip()
+            account = row[2].strip()
+            tags = row[3:]
+            if pattern.startswith('/') and pattern.endswith('/'):
+                try:
+                    pattern = re.compile(pattern[1:-1])
+                except re.error as e:
+                    print("Invalid regex '{0}' in '{1}': {2}"
+                          .format(pattern, map_file, e),
+                          file=sys.stderr)
+                    sys.exit(1)
+            mappings.append((pattern, payee, account, tags))
+    return mappings
+                
 def read_mapping_file(map_file):
     """
     Mappings are simply a CSV file with three columns.
@@ -707,22 +751,8 @@ def read_mapping_file(map_file):
     """
     mappings = []
     with open(map_file, "r", encoding='utf-8', newline='') as f:
-        map_reader = csv.reader(f)
-        for row in map_reader:
-            if len(row) > 1:
-                pattern = row[0].strip()
-                payee = row[1].strip()
-                account = row[2].strip()
-                tags = row[3:]
-                if pattern.startswith('/') and pattern.endswith('/'):
-                    try:
-                        pattern = re.compile(pattern[1:-1])
-                    except re.error as e:
-                        print("Invalid regex '{0}' in '{1}': {2}"
-                              .format(pattern, map_file, e),
-                              file=sys.stderr)
-                        sys.exit(1)
-                mappings.append((pattern, payee, account, tags))
+        mappings = read_mapping_iter(csv.reader(f))
+
     return mappings
 
 
@@ -837,15 +867,23 @@ def main():
     mappings = []
     if options.mapping_file:
         mappings = read_mapping_file(options.mapping_file)
+    else:
+        mappings = mappings_from_ledger(options.ledger_file, options.ledger_binary)
 
     if options.accounts_file:
         possible_accounts.update(read_accounts_file(options.accounts_file))
 
     # Add to possible values the ones from mappings
     for m in mappings:
-        possible_payees.add(m[1])
-        possible_accounts.add(m[2])
-        possible_tags.update(set(m[3]))
+        try:
+            possible_payees.add(m[1])
+            possible_accounts.add(m[2])
+            possible_tags.update(set(m[3]))
+        except:
+            print( "m:"+ m)
+            pprint( locals() )
+            pprint( mappings )
+            raise
 
     def get_payee_and_account(entry):
         payee = entry.desc
@@ -916,8 +954,8 @@ def main():
         Process them.
         Write Ledger lines either to filename or stdout.
         """
-        if not options.incremental:
-            out_file.truncate(0)
+        if not options.incremental and not out_file == sys.stdout:
+            pass #out_file.truncate(0)
 
         csv_lines = get_csv_lines(in_file)
         if in_file.name == '<stdin>':
@@ -951,9 +989,17 @@ def main():
             # Skip any empty lines in the input
             if len(row) == 0:
                 continue
-
-            entry = Entry(row, csv_lines[i],
-                          options)
+            entry = None
+            try:
+                entry = Entry(row, csv_lines[i],
+                              options)
+            except Exception as e:
+                logging.error(row)
+                logging.error(csv_lines[i])
+                logging.error(e)
+                logging.error(traceback.format_exc())                
+                continue
+                
 
             # detect duplicate entries in the ledger file and optionally skip or prompt user for action
             #if options.skip_dupes and csv_lines[i].strip() in csv_comments:
